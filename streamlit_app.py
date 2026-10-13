@@ -54,18 +54,29 @@ def main() -> None:
         denominator = DENOMINATORS[denominator_label]
         run = st.button("Calculate and plot", type="primary")
 
+    st.markdown("**Words or phrases**")
+    st.caption("Synonyms: Sociotechnical = socio-technical, socio technical")
     terms_text = st.text_area(
         "Words or phrases",
         value=DEFAULT_TERMS,
         height=260,
-        help="One term per line. Matching is case-insensitive and whole-word: Data does not match Database.",
+        label_visibility="collapsed",
+        help=(
+            "One term per line. Matching is case-insensitive and whole-word: Data does not match Database. "
+            "Combine synonyms on one line: Sociotechnical = socio-technical, socio technical. "
+            "The line adds every form. Overlapping text counts once, keeping the longer form."
+        ),
     )
 
     if not run:
         st.info(f"Loaded {len(corpus):,} papers, {year_lo}–{year_hi}. Choose filters, then calculate.")
         return
 
-    terms = ais_ngram.parse_terms(terms_text)
+    try:
+        terms = ais_ngram.parse_term_groups(terms_text)
+    except ValueError as exc:
+        st.error(str(exc))
+        return
     if not terms:
         st.error("Enter at least one word or phrase.")
         return
@@ -96,12 +107,13 @@ def main() -> None:
 
     value_column = {"tokens": "pct_tokens", "all": "pct_all", "with_text": "pct_with_text"}[denominator]
     digits = 4 if denominator == "tokens" else 2
+    labels = [group.display for group in terms]
     wide = result.pivot(index="year", columns="term", values=value_column)
-    wide = wide.reindex(columns=terms)
+    wide = wide.reindex(columns=labels)
     base = result.groupby("year", sort=True)[["n_papers", "n_with_text", "n_tokens"]].first()
     table = base.join(wide)
     table.index.name = "year"
-    table[terms] = table[terms].round(digits)
+    table[labels] = table[labels].round(digits)
 
     st.download_button(
         "Download CSV",

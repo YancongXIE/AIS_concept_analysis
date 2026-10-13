@@ -36,7 +36,7 @@ Information
 Information systems
 Information technology
 Knowledge
-Sociotechnical
+Sociotechnical = socio-technical, socio technical
 Software
 """
 
@@ -84,6 +84,8 @@ def _caption(result: pd.DataFrame, denominator: str, fields: list[str] | None) -
         f"{denom_note}"
         "Matching is case-insensitive and whole-word: Data does not include Database or plurals. "
         "Information includes the word inside Information systems. "
+        "A line Term = synonym, other synonym adds those forms. Overlapping text counts once, keeping the longer form. "
+        "A paper counts once if any form appears. "
         "A phrase must sit entirely inside one field. "
         f"Fields: {', '.join(ais_ngram.normalize_fields(fields))}. "
         f"Sample: {year_min}–{year_max}, {n_papers:,} papers and {n_tokens:,} words. "
@@ -92,7 +94,7 @@ def _caption(result: pd.DataFrame, denominator: str, fields: list[str] | None) -
 
 
 def run_query(
-    terms: list[str],
+    terms: list[ais_ngram.TermGroup] | list[str],
     *,
     year_min: int | None,
     year_max: int | None,
@@ -110,7 +112,7 @@ def run_query(
 
 def save_query(
     result: pd.DataFrame,
-    terms: list[str],
+    terms: list[ais_ngram.TermGroup] | list[str],
     out: Path,
     denominator: str,
     fields: list[str] | None = None,
@@ -235,7 +237,7 @@ def _form_html(
 <h1>AIS Ngram</h1>
 <p class="sub">Share of a word or phrase among all words in titles, abstracts, and keywords in <code>aisel_all_papers_20260928</code>. The default matches Google Ngram: occurrences divided by total words. One mention in a paper counts only those occurrences.</p>
 <form method="post" action="/query">
-  <label>Words or phrases <span class="hint">One per line. Case-insensitive whole words: Data does not match Database.</span></label>
+  <label>Words or phrases <span class="hint">One per line. Case-insensitive whole words: Data does not match Database. Combine synonyms as Sociotechnical = socio-technical, socio technical.</span></label>
   <textarea name="terms">{html.escape(terms)}</textarea>
   <div class="row">
     <div>
@@ -368,7 +370,7 @@ def make_handler(app: App):
                     raise ValueError("Select at least one document type")
                 if not text_fields:
                     raise ValueError("Select at least one field")
-                terms = ais_ngram.parse_terms(terms_text)
+                terms = ais_ngram.parse_term_groups(terms_text)
                 if not terms:
                     raise ValueError("Enter at least one word or phrase")
                 year_min = int(year_min_text)
@@ -439,8 +441,16 @@ def main() -> None:
     check.set_defaults(command="check")
 
     query = sub.add_parser("query", help="Calculate terms and save a CSV plus line charts")
-    query.add_argument("terms", nargs="*", help="Words or phrases. Quote a phrase that contains spaces")
-    query.add_argument("--terms-file", type=Path, help="Text file with one term per line")
+    query.add_argument(
+        "terms",
+        nargs="*",
+        help='Words or phrases. Quote spaces. Synonyms: "Sociotechnical = socio-technical"',
+    )
+    query.add_argument(
+        "--terms-file",
+        type=Path,
+        help="Text file with one term per line. Synonyms: Term = synonym, other synonym",
+    )
     query.add_argument("--year-min", type=int)
     query.add_argument("--year-max", type=int)
     query.add_argument("--types", nargs="*", choices=["Conference", "Journal", "Other"])
@@ -468,8 +478,8 @@ def main() -> None:
 
     chunks = list(args.terms)
     if args.terms_file:
-        chunks.extend(ais_ngram.parse_terms(args.terms_file.read_text(encoding="utf-8")))
-    terms = ais_ngram.parse_terms("\n".join(chunks))
+        chunks.append(args.terms_file.read_text(encoding="utf-8"))
+    terms = ais_ngram.parse_term_groups("\n".join(chunks))
     if not terms:
         parser.error("Provide at least one term as an argument or with --terms-file")
     print("Loading corpus...")

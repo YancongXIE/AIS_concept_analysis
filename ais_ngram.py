@@ -8,6 +8,7 @@ import re
 import textwrap
 import unicodedata
 from pathlib import Path
+from typing import NamedTuple
 
 import pandas as pd
 
@@ -45,28 +46,94 @@ def count_words(text: str) -> int:
     return len(_WORD.findall(text))
 
 
-def term_pattern(term: str) -> re.Pattern[str]:
-    """Whole word or whole phrase. Data does not match Database or plurals."""
+class TermGroup(NamedTuple):
+    """One plotted line. forms are the spellings whose counts are added."""
+
+    label: str
+    forms: tuple[str, ...]
+
+    @property
+    def display(self) -> str:
+        extras = [form for form in self.forms if prepare_text(form) != prepare_text(self.label)]
+        if not extras:
+            return self.label
+        return f"{self.label} (+ {', '.join(extras)})"
+
+
+def _form_body(term: str) -> str:
     prepared = prepare_text(term)
     tokens = prepared.split(" ")
     if not tokens or tokens == [""]:
         raise ValueError("A term cannot be empty")
-    body = r"\s+".join(re.escape(token) for token in tokens)
-    return re.compile(rf"(?<!{_EDGE}){body}(?!{_EDGE})")
+    return r"\s+".join(re.escape(token) for token in tokens)
+
+
+def term_pattern(term: str) -> re.Pattern[str]:
+    """Whole word or whole phrase. Data does not match Database or plurals."""
+    return re.compile(rf"(?<!{_EDGE}){_form_body(term)}(?!{_EDGE})")
+
+
+def group_pattern(forms: tuple[str, ...] | list[str]) -> re.Pattern[str]:
+    """Match any form. A longer form wins when two forms overlap, so it is counted once."""
+    ordered = sorted(forms, key=lambda form: len(prepare_text(form)), reverse=True)
+    alt = "|".join(_form_body(form) for form in ordered)
+    return re.compile(rf"(?<!{_EDGE})(?:{alt})(?!{_EDGE})")
+
+
+def parse_term_groups(text: str) -> list[TermGroup]:
+    """One term per line. Blank lines are ignored.
+
+    Synonyms: ``Sociotechnical = socio-technical, socio technical``.
+    The name before = is included, and each form after = is added to the same line.
+    """
+    seen: set[str] = set()
+    groups: list[TermGroup] = []
+    for line in text.splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        if "=" in raw:
+            label, rest = raw.split("=", 1)
+            label = label.strip()
+            extras = [part.strip() for part in rest.split(",") if part.strip()]
+            if not label:
+                raise ValueError("Write the term before =")
+        else:
+            label = raw
+            extras = []
+        forms: list[str] = []
+        form_keys: set[str] = set()
+        for form in (label, *extras):
+            key = prepare_text(form)
+            if not key or key in form_keys:
+                continue
+            form_keys.add(key)
+            forms.append(form)
+        label_key = prepare_text(label)
+        if not forms or not label_key or label_key in seen:
+            continue
+        seen.add(label_key)
+        groups.append(TermGroup(label, tuple(forms)))
+    return groups
 
 
 def parse_terms(text: str) -> list[str]:
-    """One term per line. Blank lines are ignored. Duplicate spellings keep the first form."""
+    """Labels only, in order. Duplicate labels keep the first line."""
+    return [group.label for group in parse_term_groups(text)]
+
+
+def _as_groups(terms: list[TermGroup] | list[str]) -> list[TermGroup]:
+    groups: list[TermGroup] = []
     seen: set[str] = set()
-    terms: list[str] = []
-    for line in text.splitlines():
-        display = line.strip()
-        key = prepare_text(display)
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        terms.append(display)
-    return terms
+    for term in terms:
+        parsed = [term] if isinstance(term, TermGroup) else parse_term_groups(str(term))
+        for group in parsed:
+            key = prepare_text(group.label)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            groups.append(group)
+    return groups
 
 
 def load_corpus(path: Path = DATA_PATH, cache_path: Path = CACHE_PATH, refresh: bool = False) -> pd.DataFrame:
@@ -172,19 +239,23 @@ def filter_corpus(
 
 def query_terms(
     frame: pd.DataFrame,
-    terms: list[str],
+    terms: list[TermGroup] | list[str],
     fields: list[str] | None = None,
 ) -> pd.DataFrame:
     """Long table with word share and paper share for each term and year.
 
     pct_tokens: occurrences / all words in the selected fields that year.
     Repeated occurrences in one paper are counted again.
+    A synonym line adds the occurrences of each form. Overlapping forms count once,
+    and the longer form is kept.
     pct_all: papers with at least one occurrence / all papers that year.
     pct_with_text: papers with at least one occurrence / papers that have text in a selected field.
+    A paper counts once when any synonym form appears.
     """
     if frame.empty:
         raise ValueError("No papers match the current filters")
-    if not terms:
+    groups = _as_groups(terms)
+    if not groups:
         raise ValueError("Enter at least one word or phrase")
     selected = normalize_fields(fields)
     if any(field not in frame.columns or f"n_{field}" not in frame.columns for field in selected):
@@ -203,15 +274,17 @@ def query_terms(
         n_tokens=("n_tokens", "sum"),
     )
     pieces: list[pd.DataFrame] = []
-    for term in terms:
-        pattern = term_pattern(term)
+    labels = [group.display for group in groups]
+    for group in groups:
+        pattern = group_pattern(group.forms)
         occurrences = sum(frame[field].str.count(pattern) for field in selected)
         n_occurrences = occurrences.groupby(frame["year"], sort=True).sum().astype(int)
         n_hit = (occurrences > 0).groupby(frame["year"], sort=True).sum().astype(int)
         part = counts.copy()
         part["n_occurrences"] = n_occurrences.reindex(part.index).fillna(0).astype(int)
         part["n_hit"] = n_hit.reindex(part.index).fillna(0).astype(int)
-        part["term"] = term
+        part["term"] = group.display
+        part["forms"] = " | ".join(group.forms)
         pieces.append(part.reset_index())
 
     result = pd.concat(pieces, ignore_index=True)
@@ -226,11 +299,12 @@ def query_terms(
     result.loc[has_base, "pct_with_text"] = (
         result.loc[has_base, "n_hit"] / result.loc[has_base, "n_with_text"] * 100
     )
-    result["term"] = pd.Categorical(result["term"], categories=terms, ordered=True)
+    result["term"] = pd.Categorical(result["term"], categories=labels, ordered=True)
     result = result.sort_values(["term", "year"]).reset_index(drop=True)
     return result[
         [
             "term",
+            "forms",
             "year",
             "n_papers",
             "n_with_text",
@@ -283,7 +357,7 @@ _FALLBACK_LINES = ["-", "--", "-.", ":"]
 
 
 def _style_for(term: str, index: int) -> tuple[str, str]:
-    known = _KNOWN_STYLE.get(prepare_text(term))
+    known = _KNOWN_STYLE.get(prepare_text(term.split(" (+ ", 1)[0]))
     if known:
         return known
     return (
@@ -350,7 +424,7 @@ def _chart_path(path: Path, label: str, groups: int) -> Path:
 
 def plot_percentages(
     result: pd.DataFrame,
-    terms: list[str],
+    terms: list[TermGroup] | list[str],
     *,
     denominator: str = "tokens",
     title: str | None = None,
@@ -360,6 +434,7 @@ def plot_percentages(
     """Draw one line chart per magnitude group. Returns (label, path, png bytes)."""
     if denominator not in VALUE_COLUMNS:
         raise ValueError("denominator must be tokens, all, or with_text")
+    terms = [group.display for group in _as_groups(terms)]
     value_col, ylabel = VALUE_COLUMNS[denominator]
     plt = _setup_matplotlib()
     from matplotlib.ticker import FormatStrFormatter, MultipleLocator
@@ -481,5 +556,38 @@ def run_self_check() -> None:
         hit = bool(pattern.search(prepare_text(abstract)) or pattern.search(prepare_text(keywords)))
         if hit != expected:
             failures.append(f"{term!r} in {abstract!r} / {keywords!r}: got {hit}, expected {expected}")
+    combined = group_pattern(("information", "information systems"))
+    combined_text = prepare_text("information systems and information")
+    if len(combined.findall(combined_text)) != 2:
+        failures.append("overlapping synonyms should count the longer form once")
+    groups = parse_term_groups("Sociotechnical = socio-technical, socio-technical\nData\n\nData")
+    if [group.label for group in groups] != ["Sociotechnical", "Data"]:
+        failures.append("synonym lines were not parsed")
+    if groups[0].forms != ("Sociotechnical", "socio-technical"):
+        failures.append(f"unexpected forms: {groups[0].forms}")
+    sample = pd.DataFrame(
+        {
+            "year": [2020, 2020],
+            "title": [prepare_text("Sociotechnical design"), prepare_text("A socio-technical study")],
+            "abstract": ["", ""],
+            "keywords": ["", ""],
+        }
+    )
+    sample = _attach_token_counts(sample)
+    combined_result = query_terms(sample, groups[:1], ["title"])
+    if int(combined_result["n_occurrences"].iloc[0]) != 2 or int(combined_result["n_hit"].iloc[0]) != 2:
+        failures.append("synonym counts were not added")
+    nested = pd.DataFrame(
+        {
+            "year": [2020],
+            "title": [prepare_text("Information systems")],
+            "abstract": [""],
+            "keywords": [prepare_text("information")],
+        }
+    )
+    nested = _attach_token_counts(nested)
+    nested_result = query_terms(nested, parse_term_groups("Information = information systems"), ["title", "keywords"])
+    if int(nested_result["n_occurrences"].iloc[0]) != 2 or int(nested_result["n_hit"].iloc[0]) != 1:
+        failures.append("nested synonyms were double-counted")
     if failures:
         raise AssertionError("Match check failed:\n" + "\n".join(failures))
